@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <title>BLE DPV 曲线绘图器</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: #f4f7f8;
+      --surface: #ffffff;
+      --text: #172126;
+      --muted: #617079;
+      --line: #d7e0e4;
+      --primary: #0f766e;
+      --primary-strong: #0a5d57;
+      --primary-soft: #dff3f0;
+      --danger: #b42318;
+      --shadow: 0 8px 30px rgba(21, 46, 56, 0.08);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #0d1417;
+        --surface: #151f23;
+        --text: #edf4f6;
+        --muted: #a6b5bb;
+        --line: #334249;
+        --primary: #38b2a6;
+        --primary-strong: #63c9bf;
+        --primary-soft: #183d3a;
+        --danger: #ff8b82;
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--page);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    button, input { font: inherit; }
+
+    .app {
+      width: min(100%, 980px);
+      margin: 0 auto;
+      padding: max(16px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom));
+    }
+
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.35rem, 5vw, 2rem);
+      font-weight: 700;
+    }
+
+    .subtitle {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .status {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 0.85rem;
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .status.connected { color: var(--primary-strong); }
+    .status.connected .status-dot { background: var(--primary); }
+    .status.error { color: var(--danger); }
+    .status.error .status-dot { background: var(--danger); }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      align-items: center;
+    }
+
+    button {
+      min-height: 42px;
+      padding: 9px 15px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #ffffff;
+      font-weight: 650;
+    }
+
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .message {
+      flex: 1 1 240px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+      overflow-wrap: anywhere;
+    }
+
+    .message.error { color: var(--danger); }
+
+    details {
+      margin-top: 11px;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+
+    summary { color: var(--muted); cursor: pointer; }
+
+    .uuid-grid, .axis-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 11px;
+    }
+
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 0.83rem;
+    }
+
+    input {
+      width: 100%;
+      min-height: 41px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 8px 10px;
+      background: var(--page);
+      color: var(--text);
+    }
+
+    input:focus {
+      outline: 3px solid var(--primary-soft);
+      border-color: var(--primary);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 9px;
+      margin-bottom: 12px;
+    }
+
+    .stat {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 11px;
+    }
+
+    .stat-label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: clamp(1.05rem, 4vw, 1.35rem);
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+    }
+
+    .chart-panel { padding: 12px 10px 8px; }
+
+    .chart-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+      padding: 0 4px 8px;
+    }
+
+    .chart-heading h2 { margin: 0; font-size: 1rem; }
+    .chart-heading span { color: var(--muted); font-size: 0.8rem; }
+
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: clamp(300px, 58vw, 520px);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+
+    .axis-title {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .footer-note {
+      margin: 10px 2px 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 620px) {
+      header { align-items: stretch; flex-direction: column; }
+      .status { align-self: flex-start; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .uuid-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <h1>BLE DPV 曲线绘图器</h1>
+        <p class="subtitle">9字节数据帧 · 小端序 · 实时绘图</p>
+      </div>
+      <div id="status" class="status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="statusText">未连接</span>
+      </div>
+    </header>
+
+    <section class="panel" aria-label="蓝牙连接">
+      <div class="toolbar">
+        <button id="connectButton" class="primary" type="button">连接 BLE</button>
+        <button id="disconnectButton" type="button" disabled>断开</button>
+        <button id="clearButton" type="button">清空曲线</button>
+        <p id="message" class="message">请使用安卓 Chrome，并通过 HTTPS 打开本页。</p>
+      </div>
+      <details>
+        <summary>BLE UUID 设置</summary>
+        <div class="uuid-grid">
+          <label>服务 UUID
+            <input id="serviceUuid" type="text" value="0000ffe0-0000-1000-8000-00805f9b34fb" autocomplete="off" spellcheck="false">
+          </label>
+          <label>通知特征 UUID
+            <input id="characteristicUuid" type="text" value="0000ffe1-0000-1000-8000-00805f9b34fb" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+      </details>
+    </section>
+
+    <section class="stats" aria-label="实时数据">
+      <div class="stat"><span class="stat-label">最新 point</span><strong id="pointValue" class="stat-value">—</strong></div>
+      <div class="stat"><span class="stat-label">最新 current</span><strong id="currentValue" class="stat-value">—</strong></div>
+      <div class="stat"><span class="stat-label">有效数据包</span><strong id="validValue" class="stat-value">0</strong></div>
+      <div class="stat"><span class="stat-label">错误数据包</span><strong id="errorValue" class="stat-value">0</strong></div>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="chart-heading">
+        <h2>差分电流曲线</h2>
+        <span id="pointCount">0 个绘图点</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="chart" role="img" aria-label="横轴为DPV点编号、纵轴为差分电流的实时曲线图"></canvas>
+      </div>
+    </section>
+
+    <section class="panel" aria-label="坐标轴范围">
+      <p class="axis-title">坐标轴范围（X轴和Y轴分别设置）</p>
+      <div class="axis-grid">
+        <label>X轴下限
+          <input id="xMin" type="number" value="0" step="1" inputmode="numeric">
+        </label>
+        <label>X轴上限
+          <input id="xMax" type="number" value="100" step="1" inputmode="numeric">
+        </label>
+        <label>Y轴下限（nA）
+          <input id="yMin" type="number" value="-3000" step="1" inputmode="numeric">
+        </label>
+        <label>Y轴上限（nA）
+          <input id="yMax" type="number" value="3000" step="1" inputmode="numeric">
+        </label>
+      </div>
+      <p class="footer-note">帧格式：A5 + point(uint16) + current(int32) + 累加校验(uint8) + 5A。校验范围为6字节数据区。</p>
+    </section>
+  </main>
+
+  <script>
+    'use strict';
+
+    const FRAME_LENGTH = 9;
+    const FRAME_HEAD = 0xA5;
+    const FRAME_TAIL = 0x5A;
+    const MAX_PLOT_POINTS = 5000;
+
+    const elements = {
+      status: document.getElementById('status'),
+      statusText: document.getElementById('statusText'),
+      message: document.getElementById('message'),
+      connectButton: document.getElementById('connectButton'),
+      disconnectButton: document.getElementById('disconnectButton'),
+      clearButton: document.getElementById('clearButton'),
+      serviceUuid: document.getElementById('serviceUuid'),
+      characteristicUuid: document.getElementById('characteristicUuid'),
+      pointValue: document.getElementById('pointValue'),
+      currentValue: document.getElementById('currentValue'),
+      validValue: document.getElementById('validValue'),
+      errorValue: document.getElementById('errorValue'),
+      pointCount: document.getElementById('pointCount'),
+      xMin: document.getElementById('xMin'),
+      xMax: document.getElementById('xMax'),
+      yMin: document.getElementById('yMin'),
+      yMax: document.getElementById('yMax'),
+      canvas: document.getElementById('chart')
+    };
+
+    const context = elements.canvas.getContext('2d');
+    let bluetoothDevice = null;
+    let notifyCharacteristic = null;
+    let receiveBuffer = new Uint8Array(0);
+    let plotData = [];
+    let validFrames = 0;
+    let errorFrames = 0;
+
+    function setStatus(kind, text) {
+      elements.status.className = `status ${kind || ''}`.trim();
+      elements.statusText.textContent = text;
+    }
+
+    function setMessage(text, isError = false) {
+      elements.message.textContent = text;
+      elements.message.classList.toggle('error', isError);
+    }
+
+    function normalizeUuid(value) {
+      return value.trim().toLowerCase();
+    }
+
+    async function connectBle() {
+      if (!window.isSecureContext) {
+        setStatus('error', '环境不安全');
+        setMessage('Web Bluetooth 要求 HTTPS；请勿直接用 file:// 打开。', true);
+        return;
+      }
+      if (!navigator.bluetooth) {
+        setStatus('error', '浏览器不支持');
+        setMessage('当前浏览器不支持 Web Bluetooth，请使用安卓 Chrome。', true);
+        return;
+      }
+
+      const serviceUuid = normalizeUuid(elements.serviceUuid.value);
+      const characteristicUuid = normalizeUuid(elements.characteristicUuid.value);
+      if (!serviceUuid || !characteristicUuid) {
+        setMessage('请填写服务 UUID 和通知特征 UUID。', true);
+        return;
+      }
+
+      try {
+        elements.connectButton.disabled = true;
+        setStatus('', '选择设备…');
+        setMessage('请在系统设备列表中选择你的 BLE 模块。');
+
+        bluetoothDevice = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: [serviceUuid]
+        });
+        bluetoothDevice.addEventListener('gattserverdisconnected', handleDisconnected);
+
+        setStatus('', '正在连接…');
+        const server = await bluetoothDevice.gatt.connect();
+        const service = await server.getPrimaryService(serviceUuid);
+        notifyCharacteristic = await service.getCharacteristic(characteristicUuid);
+        await notifyCharacteristic.startNotifications();
+        notifyCharacteristic.addEventListener('characteristicvaluechanged', handleNotification);
+
+        receiveBuffer = new Uint8Array(0);
+        elements.disconnectButton.disabled = false;
+        setStatus('connected', '已连接');
+        setMessage(`已连接：${bluetoothDevice.name || '未命名设备'}，正在接收数据。`);
+      } catch (error) {
+        elements.connectButton.disabled = false;
+        elements.disconnectButton.disabled = true;
+        setStatus('error', '连接失败');
+        setMessage(`连接失败：${error.message || error}`, true);
+      }
+    }
+
+    function disconnectBle() {
+      if (notifyCharacteristic) {
+        notifyCharacteristic.removeEventListener('characteristicvaluechanged', handleNotification);
+      }
+      if (bluetoothDevice && bluetoothDevice.gatt && bluetoothDevice.gatt.connected) {
+        bluetoothDevice.gatt.disconnect();
+      } else {
+        handleDisconnected();
+      }
+    }
+
+    function handleDisconnected() {
+      notifyCharacteristic = null;
+      receiveBuffer = new Uint8Array(0);
+      elements.connectButton.disabled = false;
+      elements.disconnectButton.disabled = true;
+      setStatus('', '未连接');
+      setMessage('BLE 已断开，可重新连接。');
+    }
+
+    function handleNotification(event) {
+      const value = event.target.value;
+      const chunk = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      appendAndParse(chunk);
+    }
+
+    function appendAndParse(chunk) {
+      const combined = new Uint8Array(receiveBuffer.length + chunk.length);
+      combined.set(receiveBuffer, 0);
+      combined.set(chunk, receiveBuffer.length);
+      receiveBuffer = combined;
+
+      while (receiveBuffer.length >= FRAME_LENGTH) {
+        const headIndex = receiveBuffer.indexOf(FRAME_HEAD);
+
+        if (headIndex < 0) {
+          receiveBuffer = new Uint8Array(0);
+          return;
+        }
+        if (headIndex > 0) {
+          receiveBuffer = receiveBuffer.slice(headIndex);
+          if (receiveBuffer.length < FRAME_LENGTH) return;
+        }
+
+        if (receiveBuffer[FRAME_LENGTH - 1] !== FRAME_TAIL) {
+          errorFrames += 1;
+          receiveBuffer = receiveBuffer.slice(1);
+          updateCounters();
+          continue;
+        }
+
+        const frame = receiveBuffer.slice(0, FRAME_LENGTH);
+        receiveBuffer = receiveBuffer.slice(FRAME_LENGTH);
+
+        let checksum = 0;
+        for (let index = 1; index <= 6; index += 1) {
+          checksum = (checksum + frame[index]) & 0xFF;
+        }
+
+        if (checksum !== frame[7]) {
+          errorFrames += 1;
+          updateCounters();
+          continue;
+        }
+
+        const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+        const point = view.getUint16(1, true);
+        const current = view.getInt32(3, true);
+        acceptDataPoint(point, current);
+      }
+    }
+
+    function acceptDataPoint(point, current) {
+      validFrames += 1;
+      plotData.push({ point, current });
+      if (plotData.length > MAX_PLOT_POINTS) {
+        plotData.splice(0, plotData.length - MAX_PLOT_POINTS);
+      }
+
+      elements.pointValue.textContent = String(point);
+      elements.currentValue.textContent = `${current} nA`;
+      updateCounters();
+      drawChart();
+    }
+
+    function updateCounters() {
+      elements.validValue.textContent = String(validFrames);
+      elements.errorValue.textContent = String(errorFrames);
+      elements.pointCount.textContent = `${plotData.length} 个绘图点`;
+    }
+
+    function clearChart() {
+      plotData = [];
+      validFrames = 0;
+      errorFrames = 0;
+      receiveBuffer = new Uint8Array(0);
+      elements.pointValue.textContent = '—';
+      elements.currentValue.textContent = '—';
+      updateCounters();
+      drawChart();
+    }
+
+    function readDomain() {
+      const domain = {
+        xMin: Number(elements.xMin.value),
+        xMax: Number(elements.xMax.value),
+        yMin: Number(elements.yMin.value),
+        yMax: Number(elements.yMax.value)
+      };
+      const valid = Object.values(domain).every(Number.isFinite)
+        && domain.xMax > domain.xMin
+        && domain.yMax > domain.yMin;
+      return valid ? domain : null;
+    }
+
+    function themeColor(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function formatTick(value) {
+      const magnitude = Math.abs(value);
+      if (magnitude >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
+      if (magnitude >= 10000) return `${(value / 1000).toFixed(0)}k`;
+      return Number.isInteger(value) ? String(value) : value.toFixed(1);
+    }
+
+    function drawChart() {
+      const bounds = elements.canvas.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.round(bounds.width);
+      const height = Math.round(bounds.height);
+      const targetWidth = Math.round(width * dpr);
+      const targetHeight = Math.round(height * dpr);
+      if (elements.canvas.width !== targetWidth || elements.canvas.height !== targetHeight) {
+        elements.canvas.width = targetWidth;
+        elements.canvas.height = targetHeight;
+      }
+
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const colors = {
+        text: themeColor('--text'),
+        muted: themeColor('--muted'),
+        line: themeColor('--line'),
+        surface: themeColor('--surface'),
+        primary: themeColor('--primary')
+      };
+      const margin = { left: width < 430 ? 58 : 70, right: 14, top: 16, bottom: 48 };
+      const plotWidth = Math.max(1, width - margin.left - margin.right);
+      const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+      const domain = readDomain();
+
+      context.fillStyle = colors.surface;
+      context.fillRect(margin.left, margin.top, plotWidth, plotHeight);
+      context.font = '12px system-ui, sans-serif';
+      context.lineWidth = 1;
+
+      if (!domain) {
+        context.fillStyle = colors.muted;
+        context.textAlign = 'center';
+        context.fillText('坐标轴上限必须大于下限', width / 2, height / 2);
+        return;
+      }
+
+      const xToPixel = value => margin.left + ((value - domain.xMin) / (domain.xMax - domain.xMin)) * plotWidth;
+      const yToPixel = value => margin.top + plotHeight - ((value - domain.yMin) / (domain.yMax - domain.yMin)) * plotHeight;
+      const tickCount = width < 430 ? 4 : 5;
+
+      context.strokeStyle = colors.line;
+      context.fillStyle = colors.muted;
+      for (let index = 0; index <= tickCount; index += 1) {
+        const fraction = index / tickCount;
+        const x = margin.left + fraction * plotWidth;
+        const y = margin.top + fraction * plotHeight;
+
+        context.beginPath();
+        context.moveTo(x, margin.top);
+        context.lineTo(x, margin.top + plotHeight);
+        context.stroke();
+        context.textAlign = 'center';
+        context.textBaseline = 'top';
+        context.fillText(formatTick(domain.xMin + fraction * (domain.xMax - domain.xMin)), x, margin.top + plotHeight + 8);
+
+        context.beginPath();
+        context.moveTo(margin.left, y);
+        context.lineTo(margin.left + plotWidth, y);
+        context.stroke();
+        context.textAlign = 'right';
+        context.textBaseline = 'middle';
+        context.fillText(formatTick(domain.yMax - fraction * (domain.yMax - domain.yMin)), margin.left - 8, y);
+      }
+
+      context.strokeStyle = colors.text;
+      context.strokeRect(margin.left, margin.top, plotWidth, plotHeight);
+      context.fillStyle = colors.text;
+      context.textAlign = 'center';
+      context.textBaseline = 'bottom';
+      context.fillText('DPV 点编号', margin.left + plotWidth / 2, height - 2);
+
+      context.save();
+      context.translate(13, margin.top + plotHeight / 2);
+      context.rotate(-Math.PI / 2);
+      context.textBaseline = 'top';
+      context.fillText('差分电流 (nA)', 0, 0);
+      context.restore();
+
+      if (plotData.length === 0) {
+        context.fillStyle = colors.muted;
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        context.fillText('连接 BLE 后等待数据', margin.left + plotWidth / 2, margin.top + plotHeight / 2);
+        return;
+      }
+
+      context.save();
+      context.beginPath();
+      context.rect(margin.left, margin.top, plotWidth, plotHeight);
+      context.clip();
+      context.beginPath();
+      let drawing = false;
+      for (const sample of plotData) {
+        if (sample.point < domain.xMin || sample.point > domain.xMax
+          || sample.current < domain.yMin || sample.current > domain.yMax) {
+          drawing = false;
+          continue;
+        }
+        const x = xToPixel(sample.point);
+        const y = yToPixel(sample.current);
+        if (!drawing) {
+          context.moveTo(x, y);
+          drawing = true;
+        } else {
+          context.lineTo(x, y);
+        }
+      }
+      context.strokeStyle = colors.primary;
+      context.lineWidth = 2;
+      context.lineJoin = 'round';
+      context.lineCap = 'round';
+      context.stroke();
+
+      const latest = plotData[plotData.length - 1];
+      if (latest.point >= domain.xMin && latest.point <= domain.xMax
+        && latest.current >= domain.yMin && latest.current <= domain.yMax) {
+        context.beginPath();
+        context.arc(xToPixel(latest.point), yToPixel(latest.current), 3.5, 0, Math.PI * 2);
+        context.fillStyle = colors.primary;
+        context.fill();
+      }
+      context.restore();
+    }
+
+    elements.connectButton.addEventListener('click', connectBle);
+    elements.disconnectButton.addEventListener('click', disconnectBle);
+    elements.clearButton.addEventListener('click', clearChart);
+    [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
+      .forEach(input => input.addEventListener('input', drawChart));
+
+    const resizeObserver = new ResizeObserver(drawChart);
+    resizeObserver.observe(elements.canvas.parentElement);
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawChart);
+
+    if (!window.isSecureContext) {
+      setStatus('error', '需要 HTTPS');
+      setMessage('请将网页部署到 HTTPS 地址后再使用蓝牙功能。', true);
+    } else if (!navigator.bluetooth) {
+      setStatus('error', '浏览器不支持');
+      setMessage('请使用支持 Web Bluetooth 的安卓 Chrome。', true);
+    }
+    drawChart();
+  </script>
+</body>
+</html>
