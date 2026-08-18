@@ -132,6 +132,11 @@
       font-weight: 650;
     }
 
+    button.stop {
+      border-color: #b42318;
+      color: #b42318;
+    }
+
     button:disabled { opacity: 0.45; cursor: not-allowed; }
 
     .message {
@@ -276,6 +281,8 @@
       <div class="toolbar">
         <button id="connectButton" class="primary" type="button">连接 BLE</button>
         <button id="disconnectButton" type="button" disabled>断开</button>
+        <button id="startButton" class="primary" type="button" disabled>开始检测</button>
+        <button id="stopButton" class="stop" type="button" disabled>停止检测</button>
         <button id="clearButton" type="button">清空曲线</button>
         <p id="message" class="message">请使用安卓 Chrome，并通过 HTTPS 打开本页。</p>
       </div>
@@ -287,6 +294,9 @@
           </label>
           <label>通知特征 UUID
             <input id="characteristicUuid" type="text" value="0000ffe1-0000-1000-8000-00805f9b34fb" autocomplete="off" spellcheck="false">
+          </label>
+          <label>控制特征 UUID（留空则同通知特征）
+            <input id="controlCharacteristicUuid" type="text" value="" autocomplete="off" spellcheck="false">
           </label>
         </div>
       </details>
@@ -336,6 +346,8 @@
     const FRAME_HEAD = 0xA5;
     const FRAME_TAIL = 0x5A;
     const MAX_PLOT_POINTS = 5000;
+    const COMMAND_START = 0x01;
+    const COMMAND_STOP = 0x02;
 
     const elements = {
       status: document.getElementById('status'),
@@ -343,9 +355,12 @@
       message: document.getElementById('message'),
       connectButton: document.getElementById('connectButton'),
       disconnectButton: document.getElementById('disconnectButton'),
+      startButton: document.getElementById('startButton'),
+      stopButton: document.getElementById('stopButton'),
       clearButton: document.getElementById('clearButton'),
       serviceUuid: document.getElementById('serviceUuid'),
       characteristicUuid: document.getElementById('characteristicUuid'),
+      controlCharacteristicUuid: document.getElementById('controlCharacteristicUuid'),
       pointValue: document.getElementById('pointValue'),
       currentValue: document.getElementById('currentValue'),
       validValue: document.getElementById('validValue'),
@@ -361,6 +376,7 @@
     const context = elements.canvas.getContext('2d');
     let bluetoothDevice = null;
     let notifyCharacteristic = null;
+    let controlCharacteristic = null;
     let receiveBuffer = new Uint8Array(0);
     let plotData = [];
     let validFrames = 0;
@@ -380,6 +396,11 @@
       return value.trim().toLowerCase();
     }
 
+    function setControlButtons(enabled) {
+      elements.startButton.disabled = !enabled;
+      elements.stopButton.disabled = !enabled;
+    }
+
     async function connectBle() {
       if (!window.isSecureContext) {
         setStatus('error', '环境不安全');
@@ -394,6 +415,7 @@
 
       const serviceUuid = normalizeUuid(elements.serviceUuid.value);
       const characteristicUuid = normalizeUuid(elements.characteristicUuid.value);
+      const controlUuid = normalizeUuid(elements.controlCharacteristicUuid.value) || characteristicUuid;
       if (!serviceUuid || !characteristicUuid) {
         setMessage('请填写服务 UUID 和通知特征 UUID。', true);
         return;
@@ -416,14 +438,24 @@
         notifyCharacteristic = await service.getCharacteristic(characteristicUuid);
         await notifyCharacteristic.startNotifications();
         notifyCharacteristic.addEventListener('characteristicvaluechanged', handleNotification);
+        controlCharacteristic = controlUuid === characteristicUuid
+          ? notifyCharacteristic
+          : await service.getCharacteristic(controlUuid);
+
+        if (!controlCharacteristic.properties.write
+          && !controlCharacteristic.properties.writeWithoutResponse) {
+          throw new Error('控制特征不支持写入');
+        }
 
         receiveBuffer = new Uint8Array(0);
         elements.disconnectButton.disabled = false;
+        setControlButtons(true);
         setStatus('connected', '已连接');
-        setMessage(`已连接：${bluetoothDevice.name || '未命名设备'}，正在接收数据。`);
+        setMessage(`已连接：${bluetoothDevice.name || '未命名设备'}，请点击“开始检测”。`);
       } catch (error) {
         elements.connectButton.disabled = false;
         elements.disconnectButton.disabled = true;
+        setControlButtons(false);
         setStatus('error', '连接失败');
         setMessage(`连接失败：${error.message || error}`, true);
       }
@@ -442,11 +474,59 @@
 
     function handleDisconnected() {
       notifyCharacteristic = null;
+      controlCharacteristic = null;
       receiveBuffer = new Uint8Array(0);
       elements.connectButton.disabled = false;
       elements.disconnectButton.disabled = true;
+      setControlButtons(false);
       setStatus('', '未连接');
       setMessage('BLE 已断开，可重新连接。');
+    }
+
+    async function sendBleCommand(command) {
+      if (!controlCharacteristic) {
+        throw new Error('BLE 尚未连接');
+      }
+
+      const packet = new Uint8Array([
+        FRAME_HEAD,
+        command,
+        command,
+        FRAME_TAIL
+      ]);
+
+      if (controlCharacteristic.properties.writeWithoutResponse) {
+        await controlCharacteristic.writeValueWithoutResponse(packet);
+      } else if (controlCharacteristic.properties.write) {
+        await controlCharacteristic.writeValueWithResponse(packet);
+      } else {
+        throw new Error('控制特征不支持写入');
+      }
+    }
+
+    async function startMeasurement() {
+      try {
+        elements.startButton.disabled = true;
+        await sendBleCommand(COMMAND_START);
+        clearChart();
+        setMessage('开始命令已发送，等待 DPV 数据。');
+      } catch (error) {
+        setMessage(`开始命令发送失败：${error.message || error}`, true);
+      } finally {
+        elements.startButton.disabled = !controlCharacteristic;
+      }
+    }
+
+    async function stopMeasurement() {
+      try {
+        elements.stopButton.disabled = true;
+        await sendBleCommand(COMMAND_STOP);
+        setMessage('停止命令已发送。');
+      } catch (error) {
+        setMessage(`停止命令发送失败：${error.message || error}`, true);
+      } finally {
+        elements.stopButton.disabled = !controlCharacteristic;
+      }
     }
 
     function handleNotification(event) {
@@ -686,6 +766,8 @@
 
     elements.connectButton.addEventListener('click', connectBle);
     elements.disconnectButton.addEventListener('click', disconnectBle);
+    elements.startButton.addEventListener('click', startMeasurement);
+    elements.stopButton.addEventListener('click', stopMeasurement);
     elements.clearButton.addEventListener('click', clearChart);
     [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
       .forEach(input => input.addEventListener('input', drawChart));
