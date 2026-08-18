@@ -149,6 +149,14 @@
 
     .message.error { color: var(--danger); }
 
+    .parameter-status {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .parameter-status.error { color: var(--danger); }
+
     details {
       margin-top: 11px;
       border-top: 1px solid var(--line);
@@ -302,6 +310,23 @@
       </details>
     </section>
 
+    <section class="panel" aria-label="DPV扫描参数">
+      <p class="axis-title">DPV扫描范围（单位：mV）</p>
+      <div class="axis-grid">
+        <label>起始电位 RampStartVolt
+          <input id="rampStart" type="number" value="-400" min="-800" max="1199" step="1" inputmode="numeric">
+        </label>
+        <label>终止电位 RampPeakVolt
+          <input id="rampPeak" type="number" value="600" min="-799" max="1200" step="1" inputmode="numeric">
+        </label>
+      </div>
+      <div class="toolbar" style="margin-top: 11px">
+        <button id="refreshRangeButton" type="button" disabled>读取当前参数</button>
+        <button id="applyRangeButton" class="primary" type="button" disabled>应用扫描范围</button>
+      </div>
+      <p id="parameterStatus" class="parameter-status">连接后将自动读取STM32中的当前参数。</p>
+    </section>
+
     <section class="stats" aria-label="实时数据">
       <div class="stat"><span class="stat-label">最新 point</span><strong id="pointValue" class="stat-value">—</strong></div>
       <div class="stat"><span class="stat-label">最新 current</span><strong id="currentValue" class="stat-value">—</strong></div>
@@ -335,19 +360,28 @@
           <input id="yMax" type="number" value="3000" step="1" inputmode="numeric">
         </label>
       </div>
-      <p class="footer-note">帧格式：A5 + point(uint16) + current(int32) + 累加校验(uint8) + 5A。校验范围为6字节数据区。</p>
+      <p class="footer-note">数据帧：A5固定9字节；命令与响应帧：A6不定长、序列号、CRC16-CCITT及超时重传。</p>
     </section>
   </main>
 
   <script>
     'use strict';
 
-    const FRAME_LENGTH = 9;
-    const FRAME_HEAD = 0xA5;
+    const DATA_FRAME_LENGTH = 9;
+    const DATA_FRAME_HEAD = 0xA5;
+    const PROTOCOL_FRAME_HEAD = 0xA6;
     const FRAME_TAIL = 0x5A;
+    const FRAME_TYPE_REQUEST = 0x01;
+    const FRAME_TYPE_RESPONSE = 0x02;
+    const MAX_PROTOCOL_PAYLOAD = 32;
     const MAX_PLOT_POINTS = 5000;
     const COMMAND_START = 0x01;
     const COMMAND_STOP = 0x02;
+    const COMMAND_SET_SCAN_RANGE = 0x10;
+    const COMMAND_GET_SCAN_RANGE = 0x11;
+    const REQUEST_TIMEOUT_MS = 800;
+    const MAX_REQUEST_RETRIES = 2;
+    const STATUS_OK = 0x00;
 
     const elements = {
       status: document.getElementById('status'),
@@ -361,6 +395,11 @@
       serviceUuid: document.getElementById('serviceUuid'),
       characteristicUuid: document.getElementById('characteristicUuid'),
       controlCharacteristicUuid: document.getElementById('controlCharacteristicUuid'),
+      rampStart: document.getElementById('rampStart'),
+      rampPeak: document.getElementById('rampPeak'),
+      refreshRangeButton: document.getElementById('refreshRangeButton'),
+      applyRangeButton: document.getElementById('applyRangeButton'),
+      parameterStatus: document.getElementById('parameterStatus'),
       pointValue: document.getElementById('pointValue'),
       currentValue: document.getElementById('currentValue'),
       validValue: document.getElementById('validValue'),
@@ -381,6 +420,11 @@
     let plotData = [];
     let validFrames = 0;
     let errorFrames = 0;
+    let sequenceCounter = window.crypto && window.crypto.getRandomValues
+      ? window.crypto.getRandomValues(new Uint8Array(1))[0]
+      : Date.now() & 0xFF;
+    let pendingRequest = null;
+    let measurementRunning = false;
 
     function setStatus(kind, text) {
       elements.status.className = `status ${kind || ''}`.trim();
@@ -396,9 +440,141 @@
       return value.trim().toLowerCase();
     }
 
+    function setParameterStatus(text, isError = false) {
+      elements.parameterStatus.textContent = text;
+      elements.parameterStatus.classList.toggle('error', isError);
+    }
+
     function setControlButtons(enabled) {
       elements.startButton.disabled = !enabled;
       elements.stopButton.disabled = !enabled;
+      elements.refreshRangeButton.disabled = !enabled;
+      elements.applyRangeButton.disabled = !enabled;
+      elements.rampStart.disabled = !enabled;
+      elements.rampPeak.disabled = !enabled;
+    }
+
+    function crc16Ccitt(data) {
+      let crc = 0xFFFF;
+
+      for (const value of data) {
+        crc ^= value << 8;
+        for (let bit = 0; bit < 8; bit += 1) {
+          crc = crc & 0x8000
+            ? ((crc << 1) ^ 0x1021) & 0xFFFF
+            : (crc << 1) & 0xFFFF;
+        }
+      }
+
+      return crc;
+    }
+
+    function buildRequestFrame(sequence, command, payload = new Uint8Array(0)) {
+      if (payload.length > MAX_PROTOCOL_PAYLOAD) {
+        throw new Error('命令数据过长');
+      }
+
+      const frame = new Uint8Array(payload.length + 8);
+      frame[0] = PROTOCOL_FRAME_HEAD;
+      frame[1] = FRAME_TYPE_REQUEST;
+      frame[2] = sequence;
+      frame[3] = command;
+      frame[4] = payload.length;
+      frame.set(payload, 5);
+
+      const crcIndex = 5 + payload.length;
+      const crc = crc16Ccitt(frame.subarray(1, crcIndex));
+      frame[crcIndex] = crc & 0xFF;
+      frame[crcIndex + 1] = (crc >> 8) & 0xFF;
+      frame[crcIndex + 2] = FRAME_TAIL;
+      return frame;
+    }
+
+    function statusText(status) {
+      const names = {
+        0x00: '成功',
+        0x01: '未知命令',
+        0x02: '数据长度错误',
+        0x03: '参数无效',
+        0x04: '设备正在测量',
+        0x05: '当前状态不允许执行',
+        0x06: 'STM32内部执行错误',
+        0x07: '协议版本不支持'
+      };
+      return names[status] || `未知状态 0x${status.toString(16).padStart(2, '0')}`;
+    }
+
+    async function writeControlFrame(frame) {
+      if (!controlCharacteristic) {
+        throw new Error('BLE 尚未连接');
+      }
+
+      if (controlCharacteristic.properties.writeWithoutResponse
+        && typeof controlCharacteristic.writeValueWithoutResponse === 'function') {
+        await controlCharacteristic.writeValueWithoutResponse(frame);
+      } else if (controlCharacteristic.properties.write
+        && typeof controlCharacteristic.writeValueWithResponse === 'function') {
+        await controlCharacteristic.writeValueWithResponse(frame);
+      } else if (typeof controlCharacteristic.writeValue === 'function') {
+        await controlCharacteristic.writeValue(frame);
+      } else {
+        throw new Error('控制特征不支持写入');
+      }
+    }
+
+    function rejectPendingRequest(error) {
+      if (!pendingRequest) return;
+      const request = pendingRequest;
+      pendingRequest = null;
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+
+    async function transmitPendingRequest(request) {
+      try {
+        await writeControlFrame(request.frame);
+        if (pendingRequest === request) {
+          clearTimeout(request.timer);
+          request.timer = setTimeout(() => {
+            if (pendingRequest !== request) return;
+            if (request.retries < MAX_REQUEST_RETRIES) {
+              request.retries += 1;
+              transmitPendingRequest(request);
+            } else {
+              const error = new Error(`命令应答超时，已重试${MAX_REQUEST_RETRIES}次`);
+              rejectPendingRequest(error);
+            }
+          }, REQUEST_TIMEOUT_MS);
+        }
+      } catch (error) {
+        if (pendingRequest === request) {
+          rejectPendingRequest(error);
+        }
+      }
+    }
+
+    function sendProtocolCommand(command, payload = new Uint8Array(0)) {
+      if (pendingRequest) {
+        return Promise.reject(new Error('上一条命令仍在等待应答'));
+      }
+
+      sequenceCounter = (sequenceCounter + 1) & 0xFF;
+      const sequence = sequenceCounter;
+      const frame = buildRequestFrame(sequence, command, payload);
+
+      return new Promise((resolve, reject) => {
+        const request = {
+          sequence,
+          command,
+          frame,
+          retries: 0,
+          timer: null,
+          resolve,
+          reject
+        };
+        pendingRequest = request;
+        transmitPendingRequest(request);
+      });
     }
 
     async function connectBle() {
@@ -448,10 +624,17 @@
         }
 
         receiveBuffer = new Uint8Array(0);
+        measurementRunning = false;
         elements.disconnectButton.disabled = false;
         setControlButtons(true);
         setStatus('connected', '已连接');
         setMessage(`已连接：${bluetoothDevice.name || '未命名设备'}，请点击“开始检测”。`);
+
+        try {
+          await getScanRange();
+        } catch (error) {
+          setParameterStatus(`自动读取参数失败：${error.message || error}`, true);
+        }
       } catch (error) {
         elements.connectButton.disabled = false;
         elements.disconnectButton.disabled = true;
@@ -473,59 +656,108 @@
     }
 
     function handleDisconnected() {
+      rejectPendingRequest(new Error('BLE连接已断开'));
       notifyCharacteristic = null;
       controlCharacteristic = null;
       receiveBuffer = new Uint8Array(0);
+      measurementRunning = false;
       elements.connectButton.disabled = false;
       elements.disconnectButton.disabled = true;
       setControlButtons(false);
       setStatus('', '未连接');
       setMessage('BLE 已断开，可重新连接。');
-    }
-
-    async function sendBleCommand(command) {
-      if (!controlCharacteristic) {
-        throw new Error('BLE 尚未连接');
-      }
-
-      const packet = new Uint8Array([
-        FRAME_HEAD,
-        command,
-        command,
-        FRAME_TAIL
-      ]);
-
-      if (controlCharacteristic.properties.writeWithoutResponse) {
-        await controlCharacteristic.writeValueWithoutResponse(packet);
-      } else if (controlCharacteristic.properties.write) {
-        await controlCharacteristic.writeValueWithResponse(packet);
-      } else {
-        throw new Error('控制特征不支持写入');
-      }
+      setParameterStatus('连接后将自动读取STM32中的当前参数。');
     }
 
     async function startMeasurement() {
       try {
         elements.startButton.disabled = true;
-        await sendBleCommand(COMMAND_START);
+        const response = await sendProtocolCommand(COMMAND_START);
+        measurementRunning = response.data[0] === 0x01;
         clearChart();
-        setMessage('开始命令已发送，等待 DPV 数据。');
+        setMessage('STM32已确认开始检测，正在等待DPV数据。');
       } catch (error) {
-        setMessage(`开始命令发送失败：${error.message || error}`, true);
+        if (error.data && error.data[0] === 0x01) {
+          measurementRunning = true;
+        }
+        setMessage(`开始失败：${error.message || error}`, true);
       } finally {
-        elements.startButton.disabled = !controlCharacteristic;
+        setControlButtons(Boolean(controlCharacteristic));
       }
     }
 
     async function stopMeasurement() {
       try {
         elements.stopButton.disabled = true;
-        await sendBleCommand(COMMAND_STOP);
-        setMessage('停止命令已发送。');
+        await sendProtocolCommand(COMMAND_STOP);
+        measurementRunning = false;
+        setMessage('STM32已确认停止检测。');
       } catch (error) {
-        setMessage(`停止命令发送失败：${error.message || error}`, true);
+        setMessage(`停止失败：${error.message || error}`, true);
       } finally {
-        elements.stopButton.disabled = !controlCharacteristic;
+        setControlButtons(Boolean(controlCharacteristic));
+      }
+    }
+
+    function parseRangeResponse(data) {
+      if (data.length !== 4) {
+        throw new Error('扫描范围响应长度错误');
+      }
+
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      return {
+        start: view.getInt16(0, true),
+        peak: view.getInt16(2, true)
+      };
+    }
+
+    async function getScanRange() {
+      elements.refreshRangeButton.disabled = true;
+      setParameterStatus('正在读取STM32参数…');
+
+      try {
+        const response = await sendProtocolCommand(COMMAND_GET_SCAN_RANGE);
+        const range = parseRangeResponse(response.data);
+        elements.rampStart.value = String(range.start);
+        elements.rampPeak.value = String(range.peak);
+        setParameterStatus(`当前扫描范围：${range.start} mV ～ ${range.peak} mV`);
+        return range;
+      } finally {
+        setControlButtons(Boolean(controlCharacteristic));
+      }
+    }
+
+    async function setScanRange() {
+      const start = Number(elements.rampStart.value);
+      const peak = Number(elements.rampPeak.value);
+
+      if (!Number.isInteger(start) || !Number.isInteger(peak)) {
+        setParameterStatus('起始和终止电位必须是整数mV。', true);
+        return;
+      }
+      if (start < -800 || peak > 1200 || start >= peak || (peak - start) % 10 !== 0) {
+        setParameterStatus('范围须满足-800 ≤ 起始 < 终止 ≤ 1200 mV，且跨度为10 mV的整数倍。', true);
+        return;
+      }
+
+      const payload = new Uint8Array(4);
+      const view = new DataView(payload.buffer);
+      view.setInt16(0, start, true);
+      view.setInt16(2, peak, true);
+
+      elements.applyRangeButton.disabled = true;
+      setParameterStatus('正在设置扫描范围…');
+
+      try {
+        const response = await sendProtocolCommand(COMMAND_SET_SCAN_RANGE, payload);
+        const range = parseRangeResponse(response.data);
+        elements.rampStart.value = String(range.start);
+        elements.rampPeak.value = String(range.peak);
+        setParameterStatus(`设置成功：${range.start} mV ～ ${range.peak} mV`);
+      } catch (error) {
+        setParameterStatus(`设置失败：${error.message || error}`, true);
+      } finally {
+        setControlButtons(Boolean(controlCharacteristic));
       }
     }
 
@@ -535,14 +767,59 @@
       appendAndParse(chunk);
     }
 
+    function handleProtocolResponse(frame) {
+      const sequence = frame[2];
+      const command = frame[3];
+      const payloadLength = frame[4];
+      const payload = frame.slice(5, 5 + payloadLength);
+
+      if (frame[1] !== FRAME_TYPE_RESPONSE || payload.length < 1) {
+        errorFrames += 1;
+        updateCounters();
+        return;
+      }
+
+      if (!pendingRequest
+        || pendingRequest.sequence !== sequence
+        || pendingRequest.command !== command) {
+        return;
+      }
+
+      const request = pendingRequest;
+      pendingRequest = null;
+      clearTimeout(request.timer);
+
+      const status = payload[0];
+      const data = payload.slice(1);
+
+      if (status === STATUS_OK) {
+        request.resolve({ sequence, command, status, data });
+      } else {
+        const error = new Error(statusText(status));
+        error.status = status;
+        error.data = data;
+        request.reject(error);
+      }
+    }
+
     function appendAndParse(chunk) {
       const combined = new Uint8Array(receiveBuffer.length + chunk.length);
       combined.set(receiveBuffer, 0);
       combined.set(chunk, receiveBuffer.length);
       receiveBuffer = combined;
 
-      while (receiveBuffer.length >= FRAME_LENGTH) {
-        const headIndex = receiveBuffer.indexOf(FRAME_HEAD);
+      while (receiveBuffer.length > 0) {
+        const dataHeadIndex = receiveBuffer.indexOf(DATA_FRAME_HEAD);
+        const protocolHeadIndex = receiveBuffer.indexOf(PROTOCOL_FRAME_HEAD);
+        let headIndex;
+
+        if (dataHeadIndex < 0) {
+          headIndex = protocolHeadIndex;
+        } else if (protocolHeadIndex < 0) {
+          headIndex = dataHeadIndex;
+        } else {
+          headIndex = Math.min(dataHeadIndex, protocolHeadIndex);
+        }
 
         if (headIndex < 0) {
           receiveBuffer = new Uint8Array(0);
@@ -550,34 +827,72 @@
         }
         if (headIndex > 0) {
           receiveBuffer = receiveBuffer.slice(headIndex);
-          if (receiveBuffer.length < FRAME_LENGTH) return;
         }
 
-        if (receiveBuffer[FRAME_LENGTH - 1] !== FRAME_TAIL) {
+        if (receiveBuffer[0] === DATA_FRAME_HEAD) {
+          if (receiveBuffer.length < DATA_FRAME_LENGTH) return;
+
+          if (receiveBuffer[DATA_FRAME_LENGTH - 1] !== FRAME_TAIL) {
+            errorFrames += 1;
+            receiveBuffer = receiveBuffer.slice(1);
+            updateCounters();
+            continue;
+          }
+
+          const frame = receiveBuffer.slice(0, DATA_FRAME_LENGTH);
+          receiveBuffer = receiveBuffer.slice(DATA_FRAME_LENGTH);
+
+          let checksum = 0;
+          for (let index = 1; index <= 6; index += 1) {
+            checksum = (checksum + frame[index]) & 0xFF;
+          }
+
+          if (checksum !== frame[7]) {
+            errorFrames += 1;
+            updateCounters();
+            continue;
+          }
+
+          const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+          const point = view.getUint16(1, true);
+          const current = view.getInt32(3, true);
+          acceptDataPoint(point, current);
+          continue;
+        }
+
+        if (receiveBuffer.length < 5) return;
+
+        const payloadLength = receiveBuffer[4];
+        if (payloadLength > MAX_PROTOCOL_PAYLOAD) {
           errorFrames += 1;
           receiveBuffer = receiveBuffer.slice(1);
           updateCounters();
           continue;
         }
 
-        const frame = receiveBuffer.slice(0, FRAME_LENGTH);
-        receiveBuffer = receiveBuffer.slice(FRAME_LENGTH);
+        const protocolLength = payloadLength + 8;
+        if (receiveBuffer.length < protocolLength) return;
 
-        let checksum = 0;
-        for (let index = 1; index <= 6; index += 1) {
-          checksum = (checksum + frame[index]) & 0xFF;
+        if (receiveBuffer[protocolLength - 1] !== FRAME_TAIL) {
+          errorFrames += 1;
+          receiveBuffer = receiveBuffer.slice(1);
+          updateCounters();
+          continue;
         }
 
-        if (checksum !== frame[7]) {
+        const frame = receiveBuffer.slice(0, protocolLength);
+        receiveBuffer = receiveBuffer.slice(protocolLength);
+        const crcIndex = 5 + payloadLength;
+        const receivedCrc = frame[crcIndex] | (frame[crcIndex + 1] << 8);
+        const calculatedCrc = crc16Ccitt(frame.subarray(1, crcIndex));
+
+        if (receivedCrc !== calculatedCrc) {
           errorFrames += 1;
           updateCounters();
           continue;
         }
 
-        const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-        const point = view.getUint16(1, true);
-        const current = view.getInt32(3, true);
-        acceptDataPoint(point, current);
+        handleProtocolResponse(frame);
       }
     }
 
@@ -604,7 +919,6 @@
       plotData = [];
       validFrames = 0;
       errorFrames = 0;
-      receiveBuffer = new Uint8Array(0);
       elements.pointValue.textContent = '—';
       elements.currentValue.textContent = '—';
       updateCounters();
@@ -768,6 +1082,14 @@
     elements.disconnectButton.addEventListener('click', disconnectBle);
     elements.startButton.addEventListener('click', startMeasurement);
     elements.stopButton.addEventListener('click', stopMeasurement);
+    elements.refreshRangeButton.addEventListener('click', async () => {
+      try {
+        await getScanRange();
+      } catch (error) {
+        setParameterStatus(`读取失败：${error.message || error}`, true);
+      }
+    });
+    elements.applyRangeButton.addEventListener('click', setScanRange);
     elements.clearButton.addEventListener('click', clearChart);
     [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
       .forEach(input => input.addEventListener('input', drawChart));
