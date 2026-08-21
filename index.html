@@ -257,6 +257,17 @@
       font-size: 0.82rem;
     }
 
+    .diagnostics {
+      margin: 10px 0 0;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      font: 0.82rem/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+
     .footer-note {
       margin: 10px 2px 0;
       color: var(--muted);
@@ -334,6 +345,13 @@
       <div class="stat"><span class="stat-label">错误数据包</span><strong id="errorValue" class="stat-value">0</strong></div>
     </section>
 
+    <section class="panel" aria-label="设备可靠性诊断">
+      <div class="toolbar">
+        <button id="refreshDiagnosticsButton" type="button" disabled>读取设备诊断</button>
+      </div>
+      <pre id="diagnosticsStatus" class="diagnostics">连接后可读取初始化、错误、丢包和任务栈余量。</pre>
+    </section>
+
     <section class="panel chart-panel">
       <div class="chart-heading">
         <h2>差分电流曲线</h2>
@@ -379,6 +397,7 @@
     const COMMAND_STOP = 0x02;
     const COMMAND_SET_SCAN_RANGE = 0x10;
     const COMMAND_GET_SCAN_RANGE = 0x11;
+    const COMMAND_GET_SYSTEM_STATUS = 0x12;
     const REQUEST_TIMEOUT_MS = 800;
     const MAX_REQUEST_RETRIES = 2;
     const STATUS_OK = 0x00;
@@ -400,6 +419,8 @@
       refreshRangeButton: document.getElementById('refreshRangeButton'),
       applyRangeButton: document.getElementById('applyRangeButton'),
       parameterStatus: document.getElementById('parameterStatus'),
+      refreshDiagnosticsButton: document.getElementById('refreshDiagnosticsButton'),
+      diagnosticsStatus: document.getElementById('diagnosticsStatus'),
       pointValue: document.getElementById('pointValue'),
       currentValue: document.getElementById('currentValue'),
       validValue: document.getElementById('validValue'),
@@ -450,6 +471,7 @@
       elements.stopButton.disabled = !enabled;
       elements.refreshRangeButton.disabled = !enabled;
       elements.applyRangeButton.disabled = !enabled;
+      elements.refreshDiagnosticsButton.disabled = !enabled;
       elements.rampStart.disabled = !enabled;
       elements.rampPeak.disabled = !enabled;
     }
@@ -635,6 +657,12 @@
         } catch (error) {
           setParameterStatus(`自动读取参数失败：${error.message || error}`, true);
         }
+        try {
+          await getSystemStatus();
+        } catch (error) {
+          elements.diagnosticsStatus.textContent =
+            `自动读取诊断失败：${error.message || error}`;
+        }
       } catch (error) {
         elements.connectButton.disabled = false;
         elements.disconnectButton.disabled = true;
@@ -667,6 +695,8 @@
       setStatus('', '未连接');
       setMessage('BLE 已断开，可重新连接。');
       setParameterStatus('连接后将自动读取STM32中的当前参数。');
+      elements.diagnosticsStatus.textContent =
+        '连接后可读取初始化、错误、丢包和任务栈余量。';
     }
 
     async function startMeasurement() {
@@ -680,7 +710,14 @@
         if (error.data && error.data[0] === 0x01) {
           measurementRunning = true;
         }
-        setMessage(`开始失败：${error.message || error}`, true);
+        const code = error.data && error.data.length >= 3
+          ? new DataView(error.data.buffer,
+                         error.data.byteOffset,
+                         error.data.byteLength).getUint16(1, true)
+          : null;
+        setMessage(
+          `开始失败：${error.message || error}${code === null ? '' : `，错误码0x${code.toString(16).padStart(4, '0')}`}`,
+          true);
       } finally {
         setControlButtons(Boolean(controlCharacteristic));
       }
@@ -756,6 +793,61 @@
         setParameterStatus(`设置成功：${range.start} mV ～ ${range.peak} mV`);
       } catch (error) {
         setParameterStatus(`设置失败：${error.message || error}`, true);
+      } finally {
+        setControlButtons(Boolean(controlCharacteristic));
+      }
+    }
+
+    function parseSystemStatus(data) {
+      if (data.length !== 22) {
+        throw new Error('设备诊断响应长度错误');
+      }
+
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      return {
+        measurementState: data[0],
+        initStage: data[1],
+        initAttempt: data[2],
+        watchdogEnabled: data[3] !== 0,
+        lastError: view.getUint16(4, true),
+        uartRxDrops: view.getUint16(6, true),
+        commandQueueFull: view.getUint16(8, true),
+        dataDrops: view.getUint16(10, true),
+        dmaErrors: view.getUint16(12, true),
+        stackBluetooth: view.getUint16(14, true),
+        stackDpv: view.getUint16(16, true),
+        stackUi: view.getUint16(18, true),
+        stackMonitor: view.getUint16(20, true)
+      };
+    }
+
+    function measurementStateText(state) {
+      const names = {
+        0x00: '空闲',
+        0x01: '测量中',
+        0x02: '已停止',
+        0x03: '已完成',
+        0x04: '错误'
+      };
+      return names[state] || `未知(${state})`;
+    }
+
+    async function getSystemStatus() {
+      elements.refreshDiagnosticsButton.disabled = true;
+      elements.diagnosticsStatus.textContent = '正在读取设备诊断…';
+
+      try {
+        const response = await sendProtocolCommand(COMMAND_GET_SYSTEM_STATUS);
+        const status = parseSystemStatus(response.data);
+        const errorHex = `0x${status.lastError.toString(16).padStart(4, '0')}`;
+        elements.diagnosticsStatus.textContent = [
+          `测量状态：${measurementStateText(status.measurementState)}`,
+          `初始化：阶段${status.initStage}，尝试${status.initAttempt}次`,
+          `看门狗：${status.watchdogEnabled ? '已启用' : '未启用'}，最后错误：${errorHex}`,
+          `计数：UART丢字节${status.uartRxDrops}，命令队列满${status.commandQueueFull}，数据丢失${status.dataDrops}，DMA错误${status.dmaErrors}`,
+          `最小剩余栈(字)：BT ${status.stackBluetooth} / DPV ${status.stackDpv} / UI ${status.stackUi} / MON ${status.stackMonitor}`
+        ].join('\n');
+        return status;
       } finally {
         setControlButtons(Boolean(controlCharacteristic));
       }
@@ -1090,6 +1182,14 @@
       }
     });
     elements.applyRangeButton.addEventListener('click', setScanRange);
+    elements.refreshDiagnosticsButton.addEventListener('click', async () => {
+      try {
+        await getSystemStatus();
+      } catch (error) {
+        elements.diagnosticsStatus.textContent =
+          `读取诊断失败：${error.message || error}`;
+      }
+    });
     elements.clearButton.addEventListener('click', clearChart);
     [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
       .forEach(input => input.addEventListener('input', drawChart));
