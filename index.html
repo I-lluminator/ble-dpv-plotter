@@ -238,6 +238,20 @@
     .chart-heading h2 { margin: 0; font-size: 1rem; }
     .chart-heading span { color: var(--muted); font-size: 0.8rem; }
 
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 0 4px 8px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-swatch { width: 18px; height: 3px; border-radius: 999px; }
+    .legend-base { background: #2563eb; }
+    .legend-pulse { background: #ea580c; }
+
     .canvas-wrap {
       position: relative;
       width: 100%;
@@ -255,6 +269,17 @@
       margin: 0 0 10px;
       color: var(--muted);
       font-size: 0.82rem;
+    }
+
+    .diagnostics {
+      margin: 10px 0 0;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      font: 0.82rem/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space: pre-wrap;
     }
 
     .footer-note {
@@ -277,7 +302,7 @@
     <header>
       <div>
         <h1>BLE DPV 曲线绘图器</h1>
-        <p class="subtitle">9字节数据帧 · 小端序 · 实时绘图</p>
+        <p class="subtitle">17字节诊断数据帧 · dI / Ibase / Ipulse · 实时绘图</p>
       </div>
       <div id="status" class="status" aria-live="polite">
         <span class="status-dot" aria-hidden="true"></span>
@@ -329,9 +354,32 @@
 
     <section class="stats" aria-label="实时数据">
       <div class="stat"><span class="stat-label">最新 point</span><strong id="pointValue" class="stat-value">—</strong></div>
-      <div class="stat"><span class="stat-label">最新 current</span><strong id="currentValue" class="stat-value">—</strong></div>
+      <div class="stat"><span class="stat-label">最新 dI</span><strong id="currentValue" class="stat-value">—</strong></div>
+      <div class="stat"><span class="stat-label">最新 Ibase</span><strong id="baseValue" class="stat-value">—</strong></div>
+      <div class="stat"><span class="stat-label">最新 Ipulse</span><strong id="pulseValue" class="stat-value">—</strong></div>
       <div class="stat"><span class="stat-label">有效数据包</span><strong id="validValue" class="stat-value">0</strong></div>
       <div class="stat"><span class="stat-label">错误数据包</span><strong id="errorValue" class="stat-value">0</strong></div>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="chart-heading">
+        <h2>平台电流诊断</h2>
+        <span id="rawPointCount">0 对采样</span>
+      </div>
+      <div class="chart-legend" aria-label="诊断曲线图例">
+        <span class="legend-item"><span class="legend-swatch legend-base"></span>Ibase</span>
+        <span class="legend-item"><span class="legend-swatch legend-pulse"></span>Ipulse</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="rawChart" role="img" aria-label="横轴为DPV点编号、纵轴为Ibase和Ipulse的诊断曲线图"></canvas>
+      </div>
+    </section>
+
+    <section class="panel" aria-label="设备可靠性诊断">
+      <div class="toolbar">
+        <button id="refreshDiagnosticsButton" type="button" disabled>读取设备诊断</button>
+      </div>
+      <pre id="diagnosticsStatus" class="diagnostics">连接后可读取初始化、错误、丢包和任务栈余量。</pre>
     </section>
 
     <section class="panel chart-panel">
@@ -360,14 +408,14 @@
           <input id="yMax" type="number" value="3000" step="1" inputmode="numeric">
         </label>
       </div>
-      <p class="footer-note">数据帧：A5固定9字节；命令与响应帧：A6不定长、序列号、CRC16-CCITT及超时重传。</p>
+      <p class="footer-note">数据帧：A5固定17字节，依次为point、dI、Ibase、Ipulse、校验和及帧尾；命令与响应帧：A6不定长、序列号、CRC16-CCITT及超时重传。</p>
     </section>
   </main>
 
   <script>
     'use strict';
 
-    const DATA_FRAME_LENGTH = 9;
+    const DATA_FRAME_LENGTH = 17;
     const DATA_FRAME_HEAD = 0xA5;
     const PROTOCOL_FRAME_HEAD = 0xA6;
     const FRAME_TAIL = 0x5A;
@@ -379,6 +427,7 @@
     const COMMAND_STOP = 0x02;
     const COMMAND_SET_SCAN_RANGE = 0x10;
     const COMMAND_GET_SCAN_RANGE = 0x11;
+    const COMMAND_GET_SYSTEM_STATUS = 0x12;
     const REQUEST_TIMEOUT_MS = 800;
     const MAX_REQUEST_RETRIES = 2;
     const STATUS_OK = 0x00;
@@ -400,19 +449,26 @@
       refreshRangeButton: document.getElementById('refreshRangeButton'),
       applyRangeButton: document.getElementById('applyRangeButton'),
       parameterStatus: document.getElementById('parameterStatus'),
+      refreshDiagnosticsButton: document.getElementById('refreshDiagnosticsButton'),
+      diagnosticsStatus: document.getElementById('diagnosticsStatus'),
       pointValue: document.getElementById('pointValue'),
       currentValue: document.getElementById('currentValue'),
+      baseValue: document.getElementById('baseValue'),
+      pulseValue: document.getElementById('pulseValue'),
       validValue: document.getElementById('validValue'),
       errorValue: document.getElementById('errorValue'),
       pointCount: document.getElementById('pointCount'),
+      rawPointCount: document.getElementById('rawPointCount'),
       xMin: document.getElementById('xMin'),
       xMax: document.getElementById('xMax'),
       yMin: document.getElementById('yMin'),
       yMax: document.getElementById('yMax'),
-      canvas: document.getElementById('chart')
+      canvas: document.getElementById('chart'),
+      rawCanvas: document.getElementById('rawChart')
     };
 
     const context = elements.canvas.getContext('2d');
+    const rawContext = elements.rawCanvas.getContext('2d');
     let bluetoothDevice = null;
     let notifyCharacteristic = null;
     let controlCharacteristic = null;
@@ -450,6 +506,7 @@
       elements.stopButton.disabled = !enabled;
       elements.refreshRangeButton.disabled = !enabled;
       elements.applyRangeButton.disabled = !enabled;
+      elements.refreshDiagnosticsButton.disabled = !enabled;
       elements.rampStart.disabled = !enabled;
       elements.rampPeak.disabled = !enabled;
     }
@@ -635,6 +692,12 @@
         } catch (error) {
           setParameterStatus(`自动读取参数失败：${error.message || error}`, true);
         }
+        try {
+          await getSystemStatus();
+        } catch (error) {
+          elements.diagnosticsStatus.textContent =
+            `自动读取诊断失败：${error.message || error}`;
+        }
       } catch (error) {
         elements.connectButton.disabled = false;
         elements.disconnectButton.disabled = true;
@@ -667,6 +730,8 @@
       setStatus('', '未连接');
       setMessage('BLE 已断开，可重新连接。');
       setParameterStatus('连接后将自动读取STM32中的当前参数。');
+      elements.diagnosticsStatus.textContent =
+        '连接后可读取初始化、错误、丢包和任务栈余量。';
     }
 
     async function startMeasurement() {
@@ -680,7 +745,14 @@
         if (error.data && error.data[0] === 0x01) {
           measurementRunning = true;
         }
-        setMessage(`开始失败：${error.message || error}`, true);
+        const code = error.data && error.data.length >= 3
+          ? new DataView(error.data.buffer,
+                         error.data.byteOffset,
+                         error.data.byteLength).getUint16(1, true)
+          : null;
+        setMessage(
+          `开始失败：${error.message || error}${code === null ? '' : `，错误码0x${code.toString(16).padStart(4, '0')}`}`,
+          true);
       } finally {
         setControlButtons(Boolean(controlCharacteristic));
       }
@@ -756,6 +828,61 @@
         setParameterStatus(`设置成功：${range.start} mV ～ ${range.peak} mV`);
       } catch (error) {
         setParameterStatus(`设置失败：${error.message || error}`, true);
+      } finally {
+        setControlButtons(Boolean(controlCharacteristic));
+      }
+    }
+
+    function parseSystemStatus(data) {
+      if (data.length !== 22) {
+        throw new Error('设备诊断响应长度错误');
+      }
+
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      return {
+        measurementState: data[0],
+        initStage: data[1],
+        initAttempt: data[2],
+        watchdogEnabled: data[3] !== 0,
+        lastError: view.getUint16(4, true),
+        uartRxDrops: view.getUint16(6, true),
+        commandQueueFull: view.getUint16(8, true),
+        dataDrops: view.getUint16(10, true),
+        dmaErrors: view.getUint16(12, true),
+        stackBluetooth: view.getUint16(14, true),
+        stackDpv: view.getUint16(16, true),
+        stackUi: view.getUint16(18, true),
+        stackMonitor: view.getUint16(20, true)
+      };
+    }
+
+    function measurementStateText(state) {
+      const names = {
+        0x00: '空闲',
+        0x01: '测量中',
+        0x02: '已停止',
+        0x03: '已完成',
+        0x04: '错误'
+      };
+      return names[state] || `未知(${state})`;
+    }
+
+    async function getSystemStatus() {
+      elements.refreshDiagnosticsButton.disabled = true;
+      elements.diagnosticsStatus.textContent = '正在读取设备诊断…';
+
+      try {
+        const response = await sendProtocolCommand(COMMAND_GET_SYSTEM_STATUS);
+        const status = parseSystemStatus(response.data);
+        const errorHex = `0x${status.lastError.toString(16).padStart(4, '0')}`;
+        elements.diagnosticsStatus.textContent = [
+          `测量状态：${measurementStateText(status.measurementState)}`,
+          `初始化：阶段${status.initStage}，尝试${status.initAttempt}次`,
+          `看门狗：${status.watchdogEnabled ? '已启用' : '未启用'}，最后错误：${errorHex}`,
+          `计数：UART丢字节${status.uartRxDrops}，命令队列满${status.commandQueueFull}，数据丢失${status.dataDrops}，DMA错误${status.dmaErrors}`,
+          `最小剩余栈(字)：BT ${status.stackBluetooth} / DPV ${status.stackDpv} / UI ${status.stackUi} / MON ${status.stackMonitor}`
+        ].join('\n');
+        return status;
       } finally {
         setControlButtons(Boolean(controlCharacteristic));
       }
@@ -843,11 +970,11 @@
           receiveBuffer = receiveBuffer.slice(DATA_FRAME_LENGTH);
 
           let checksum = 0;
-          for (let index = 1; index <= 6; index += 1) {
+          for (let index = 1; index <= 14; index += 1) {
             checksum = (checksum + frame[index]) & 0xFF;
           }
 
-          if (checksum !== frame[7]) {
+          if (checksum !== frame[15]) {
             errorFrames += 1;
             updateCounters();
             continue;
@@ -856,7 +983,9 @@
           const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
           const point = view.getUint16(1, true);
           const current = view.getInt32(3, true);
-          acceptDataPoint(point, current);
+          const ibase = view.getInt32(7, true);
+          const ipulse = view.getInt32(11, true);
+          acceptDataPoint(point, current, ibase, ipulse);
           continue;
         }
 
@@ -896,23 +1025,27 @@
       }
     }
 
-    function acceptDataPoint(point, current) {
+    function acceptDataPoint(point, current, ibase, ipulse) {
       validFrames += 1;
-      plotData.push({ point, current });
+      plotData.push({ point, current, ibase, ipulse });
       if (plotData.length > MAX_PLOT_POINTS) {
         plotData.splice(0, plotData.length - MAX_PLOT_POINTS);
       }
 
       elements.pointValue.textContent = String(point);
       elements.currentValue.textContent = `${current} nA`;
+      elements.baseValue.textContent = `${ibase} nA`;
+      elements.pulseValue.textContent = `${ipulse} nA`;
       updateCounters();
       drawChart();
+      drawRawChart();
     }
 
     function updateCounters() {
       elements.validValue.textContent = String(validFrames);
       elements.errorValue.textContent = String(errorFrames);
       elements.pointCount.textContent = `${plotData.length} 个绘图点`;
+      elements.rawPointCount.textContent = `${plotData.length} 对采样`;
     }
 
     function clearChart() {
@@ -921,8 +1054,11 @@
       errorFrames = 0;
       elements.pointValue.textContent = '—';
       elements.currentValue.textContent = '—';
+      elements.baseValue.textContent = '—';
+      elements.pulseValue.textContent = '—';
       updateCounters();
       drawChart();
+      drawRawChart();
     }
 
     function readDomain() {
@@ -1078,6 +1214,158 @@
       context.restore();
     }
 
+    function drawRawChart() {
+      const bounds = elements.rawCanvas.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.round(bounds.width);
+      const height = Math.round(bounds.height);
+      const targetWidth = Math.round(width * dpr);
+      const targetHeight = Math.round(height * dpr);
+      if (elements.rawCanvas.width !== targetWidth
+        || elements.rawCanvas.height !== targetHeight) {
+        elements.rawCanvas.width = targetWidth;
+        elements.rawCanvas.height = targetHeight;
+      }
+
+      rawContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+      rawContext.clearRect(0, 0, width, height);
+
+      const colors = {
+        text: themeColor('--text'),
+        muted: themeColor('--muted'),
+        line: themeColor('--line'),
+        surface: themeColor('--surface'),
+        base: '#2563eb',
+        pulse: '#ea580c'
+      };
+      const margin = { left: width < 430 ? 58 : 70, right: 14, top: 16, bottom: 48 };
+      const plotWidth = Math.max(1, width - margin.left - margin.right);
+      const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+      const xMin = Number(elements.xMin.value);
+      const xMax = Number(elements.xMax.value);
+
+      rawContext.fillStyle = colors.surface;
+      rawContext.fillRect(margin.left, margin.top, plotWidth, plotHeight);
+      rawContext.font = '12px system-ui, sans-serif';
+      rawContext.lineWidth = 1;
+
+      if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) {
+        rawContext.fillStyle = colors.muted;
+        rawContext.textAlign = 'center';
+        rawContext.fillText('X轴上限必须大于下限', width / 2, height / 2);
+        return;
+      }
+
+      const visible = plotData.filter(sample => sample.point >= xMin
+        && sample.point <= xMax
+        && Number.isFinite(sample.ibase)
+        && Number.isFinite(sample.ipulse));
+      let yMin = -100;
+      let yMax = 100;
+      if (visible.length > 0) {
+        const values = visible.flatMap(sample => [sample.ibase, sample.ipulse]);
+        yMin = Math.min(...values);
+        yMax = Math.max(...values);
+        if (yMax <= yMin) {
+          const halfSpan = Math.max(100, Math.abs(yMax) * 0.05);
+          yMin -= halfSpan;
+          yMax += halfSpan;
+        } else {
+          const padding = Math.max(20, (yMax - yMin) * 0.1);
+          yMin -= padding;
+          yMax += padding;
+        }
+      }
+
+      const xToPixel = value => margin.left
+        + ((value - xMin) / (xMax - xMin)) * plotWidth;
+      const yToPixel = value => margin.top + plotHeight
+        - ((value - yMin) / (yMax - yMin)) * plotHeight;
+      const tickCount = width < 430 ? 4 : 5;
+
+      rawContext.strokeStyle = colors.line;
+      rawContext.fillStyle = colors.muted;
+      for (let index = 0; index <= tickCount; index += 1) {
+        const fraction = index / tickCount;
+        const x = margin.left + fraction * plotWidth;
+        const y = margin.top + fraction * plotHeight;
+
+        rawContext.beginPath();
+        rawContext.moveTo(x, margin.top);
+        rawContext.lineTo(x, margin.top + plotHeight);
+        rawContext.stroke();
+        rawContext.textAlign = 'center';
+        rawContext.textBaseline = 'top';
+        rawContext.fillText(formatTick(xMin + fraction * (xMax - xMin)),
+          x, margin.top + plotHeight + 8);
+
+        rawContext.beginPath();
+        rawContext.moveTo(margin.left, y);
+        rawContext.lineTo(margin.left + plotWidth, y);
+        rawContext.stroke();
+        rawContext.textAlign = 'right';
+        rawContext.textBaseline = 'middle';
+        rawContext.fillText(formatTick(yMax - fraction * (yMax - yMin)),
+          margin.left - 8, y);
+      }
+
+      rawContext.strokeStyle = colors.text;
+      rawContext.strokeRect(margin.left, margin.top, plotWidth, plotHeight);
+      rawContext.fillStyle = colors.text;
+      rawContext.textAlign = 'center';
+      rawContext.textBaseline = 'bottom';
+      rawContext.fillText('DPV 点编号', margin.left + plotWidth / 2, height - 2);
+
+      rawContext.save();
+      rawContext.translate(13, margin.top + plotHeight / 2);
+      rawContext.rotate(-Math.PI / 2);
+      rawContext.textBaseline = 'top';
+      rawContext.fillText('平台电流 (nA)', 0, 0);
+      rawContext.restore();
+
+      if (visible.length === 0) {
+        rawContext.fillStyle = colors.muted;
+        rawContext.textAlign = 'center';
+        rawContext.textBaseline = 'middle';
+        rawContext.fillText('等待 Ibase / Ipulse 数据',
+          margin.left + plotWidth / 2, margin.top + plotHeight / 2);
+        return;
+      }
+
+      const drawSeries = (key, color) => {
+        rawContext.beginPath();
+        visible.forEach((sample, index) => {
+          const x = xToPixel(sample.point);
+          const y = yToPixel(sample[key]);
+          if (index === 0) rawContext.moveTo(x, y);
+          else rawContext.lineTo(x, y);
+        });
+        rawContext.strokeStyle = color;
+        rawContext.lineWidth = 2;
+        rawContext.lineJoin = 'round';
+        rawContext.lineCap = 'round';
+        rawContext.stroke();
+      };
+
+      rawContext.save();
+      rawContext.beginPath();
+      rawContext.rect(margin.left, margin.top, plotWidth, plotHeight);
+      rawContext.clip();
+      drawSeries('ibase', colors.base);
+      drawSeries('ipulse', colors.pulse);
+
+      const latest = visible[visible.length - 1];
+      for (const [key, color] of [['ibase', colors.base], ['ipulse', colors.pulse]]) {
+        rawContext.beginPath();
+        rawContext.arc(xToPixel(latest.point), yToPixel(latest[key]), 3.5, 0, Math.PI * 2);
+        rawContext.fillStyle = color;
+        rawContext.fill();
+      }
+      rawContext.restore();
+    }
+
     elements.connectButton.addEventListener('click', connectBle);
     elements.disconnectButton.addEventListener('click', disconnectBle);
     elements.startButton.addEventListener('click', startMeasurement);
@@ -1090,13 +1378,31 @@
       }
     });
     elements.applyRangeButton.addEventListener('click', setScanRange);
+    elements.refreshDiagnosticsButton.addEventListener('click', async () => {
+      try {
+        await getSystemStatus();
+      } catch (error) {
+        elements.diagnosticsStatus.textContent =
+          `读取诊断失败：${error.message || error}`;
+      }
+    });
     elements.clearButton.addEventListener('click', clearChart);
     [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
-      .forEach(input => input.addEventListener('input', drawChart));
+      .forEach(input => input.addEventListener('input', () => {
+        drawChart();
+        drawRawChart();
+      }));
 
-    const resizeObserver = new ResizeObserver(drawChart);
+    const resizeObserver = new ResizeObserver(() => {
+      drawChart();
+      drawRawChart();
+    });
     resizeObserver.observe(elements.canvas.parentElement);
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawChart);
+    resizeObserver.observe(elements.rawCanvas.parentElement);
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      drawChart();
+      drawRawChart();
+    });
 
     if (!window.isSecureContext) {
       setStatus('error', '需要 HTTPS');
@@ -1106,6 +1412,7 @@
       setMessage('请使用支持 Web Bluetooth 的安卓 Chrome。', true);
     }
     drawChart();
+    drawRawChart();
   </script>
 </body>
 </html>
