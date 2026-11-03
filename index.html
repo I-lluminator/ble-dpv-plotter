@@ -317,8 +317,13 @@
         <button id="startButton" class="primary" type="button" disabled>开始检测</button>
         <button id="stopButton" class="stop" type="button" disabled>停止检测</button>
         <button id="clearButton" type="button">清空曲线</button>
+        <button id="exportButton" type="button">导出 CSV</button>
         <p id="message" class="message">请使用安卓 Chrome，并通过 HTTPS 打开本页。</p>
       </div>
+      <label>记录标签（仅用于导出，不会切换固件测试组）
+        <input id="testLabel" type="text" placeholder="例如 A_R1、B_R1、C_R1" maxlength="48" autocomplete="off">
+      </label>
+      <p id="measurementSummary" class="parameter-status">固定统计区间：point 5–27，等待数据。</p>
       <details>
         <summary>BLE UUID 设置</summary>
         <div class="uuid-grid">
@@ -441,6 +446,9 @@
       startButton: document.getElementById('startButton'),
       stopButton: document.getElementById('stopButton'),
       clearButton: document.getElementById('clearButton'),
+      exportButton: document.getElementById('exportButton'),
+      testLabel: document.getElementById('testLabel'),
+      measurementSummary: document.getElementById('measurementSummary'),
       serviceUuid: document.getElementById('serviceUuid'),
       characteristicUuid: document.getElementById('characteristicUuid'),
       controlCharacteristicUuid: document.getElementById('controlCharacteristicUuid'),
@@ -1046,6 +1054,52 @@
       elements.errorValue.textContent = String(errorFrames);
       elements.pointCount.textContent = `${plotData.length} 个绘图点`;
       elements.rawPointCount.textContent = `${plotData.length} 对采样`;
+      const summary = summarizeTimingSamples(plotData);
+      elements.measurementSummary.textContent = summary
+        ? `point 5–27：${summary.count}/23点；dI均值 ${summary.mean.toFixed(1)} nA；峰峰值 ${summary.peakToPeak} nA（${summary.min}～${summary.max}）`
+        : '固定统计区间：point 5–27，等待数据。';
+    }
+
+    function summarizeTimingSamples(samples) {
+      const values = samples.filter(sample => sample.point >= 5 && sample.point <= 27
+        && Number.isFinite(sample.current)).map(sample => sample.current);
+      if (!values.length) return null;
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      return { count: values.length, min, max, peakToPeak: max - min,
+        mean: values.reduce((sum, value) => sum + value, 0) / values.length };
+    }
+
+    function timingCsvLabel(value) {
+      return value.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'DPV_Timing';
+    }
+
+    function buildTimingCsv(samples, label) {
+      const safeLabel = timingCsvLabel(label);
+      const rows = ['run_label,point,dI_nA,Ibase_nA,Ipulse_nA'];
+      for (const sample of samples) {
+        rows.push([safeLabel, sample.point, sample.current, sample.ibase, sample.ipulse].join(','));
+      }
+      return rows.join('\r\n') + '\r\n';
+    }
+
+    function exportTimingCsv() {
+      if (!plotData.length) {
+        setMessage('当前没有可导出的采样数据。', true);
+        return;
+      }
+      const label = timingCsvLabel(elements.testLabel.value);
+      const blob = new Blob(['\uFEFF', buildTimingCsv(plotData, label)],
+        { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${label}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setMessage(`已导出 ${plotData.length} 个原始点，标签 ${label}。`);
     }
 
     function clearChart() {
@@ -1387,6 +1441,7 @@
       }
     });
     elements.clearButton.addEventListener('click', clearChart);
+    elements.exportButton.addEventListener('click', exportTimingCsv);
     [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
       .forEach(input => input.addEventListener('input', () => {
         drawChart();
