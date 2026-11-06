@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f766e">
-  <title>AD5941 双工作电极 DPV</title>
+  <title>BLE DPV 曲线绘图器</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -45,7 +45,7 @@
       font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
 
-    button, input, select { font: inherit; }
+    button, input { font: inherit; }
 
     .app {
       width: min(100%, 980px);
@@ -179,7 +179,7 @@
       font-size: 0.83rem;
     }
 
-    input, select {
+    input {
       width: 100%;
       min-height: 41px;
       border: 1px solid var(--line);
@@ -189,7 +189,7 @@
       color: var(--text);
     }
 
-    input:focus, select:focus {
+    input:focus {
       outline: 3px solid var(--primary-soft);
       border-color: var(--primary);
     }
@@ -251,8 +251,6 @@
     .legend-swatch { width: 18px; height: 3px; border-radius: 999px; }
     .legend-base { background: #2563eb; }
     .legend-pulse { background: #ea580c; }
-    .legend-we1 { background: #2563eb; }
-    .legend-we2 { background: #db2777; }
 
     .canvas-wrap {
       position: relative;
@@ -303,8 +301,8 @@
   <main class="app">
     <header>
       <div>
-        <h1>双工作电极 DPV</h1>
-        <p class="subtitle">WE1 · SE0 / LPTIA　|　WE2 · AIN0 / HSTIA</p>
+        <h1>BLE DPV 曲线绘图器</h1>
+        <p class="subtitle">17字节诊断数据帧 · dI / Ibase / Ipulse · 实时绘图</p>
       </div>
       <div id="status" class="status" aria-live="polite">
         <span class="status-dot" aria-hidden="true"></span>
@@ -322,16 +320,10 @@
         <button id="exportButton" type="button">导出 CSV</button>
         <p id="message" class="message">请使用安卓 Chrome，并通过 HTTPS 打开本页。</p>
       </div>
-      <label>记录标签（用于 CSV 导出）
-        <input id="testLabel" type="text" placeholder="例如 DualWE_R1" maxlength="48" autocomplete="off">
+      <label>记录标签（仅用于导出，不会切换固件测试组）
+        <input id="testLabel" type="text" placeholder="例如 A_R1、B_R1、C_R1" maxlength="48" autocomplete="off">
       </label>
-      <label>平台电流与实时数值
-        <select id="detailChannel">
-          <option value="0">WE1 · SE0 / LPTIA</option>
-          <option value="1">WE2 · AIN0 / HSTIA</option>
-        </select>
-      </label>
-      <p id="measurementSummary" class="parameter-status" aria-live="polite">固定统计区间 point 5–27，等待数据。</p>
+      <p id="measurementSummary" class="parameter-status">固定统计区间：point 5–27，等待数据。</p>
       <details>
         <summary>BLE UUID 设置</summary>
         <div class="uuid-grid">
@@ -400,10 +392,6 @@
         <h2>差分电流曲线</h2>
         <span id="pointCount">0 个绘图点</span>
       </div>
-      <div class="chart-legend" aria-label="差分电流图例">
-        <span class="legend-item"><span class="legend-swatch legend-we1"></span>WE1 · SE0 / LPTIA</span>
-        <span class="legend-item"><span class="legend-swatch legend-we2"></span>WE2 · AIN0 / HSTIA</span>
-      </div>
       <div class="canvas-wrap">
         <canvas id="chart" role="img" aria-label="横轴为DPV点编号、纵轴为差分电流的实时曲线图"></canvas>
       </div>
@@ -425,19 +413,15 @@
           <input id="yMax" type="number" value="3000" step="1" inputmode="numeric">
         </label>
       </div>
-      <p class="footer-note">A7 数据帧每路 18 字节，包含点号、通道、dI、Ibase 和 Ipulse。A6 命令帧使用 CRC16-CCITT。</p>
+      <p class="footer-note">数据帧：A5固定17字节，依次为point、dI、Ibase、Ipulse、校验和及帧尾；命令与响应帧：A6不定长、序列号、CRC16-CCITT及超时重传。</p>
     </section>
   </main>
 
   <script>
     'use strict';
 
-    const DATA_FRAME_LENGTH = 18;
-    const DATA_FRAME_HEAD = 0xA7;
-    const CHANNELS = [
-      { id: 0, name: 'WE1_SE0_LPTIA', color: '#2563eb' },
-      { id: 1, name: 'WE2_AIN0_HSTIA', color: '#db2777' }
-    ];
+    const DATA_FRAME_LENGTH = 17;
+    const DATA_FRAME_HEAD = 0xA5;
     const PROTOCOL_FRAME_HEAD = 0xA6;
     const FRAME_TAIL = 0x5A;
     const FRAME_TYPE_REQUEST = 0x01;
@@ -464,7 +448,6 @@
       clearButton: document.getElementById('clearButton'),
       exportButton: document.getElementById('exportButton'),
       testLabel: document.getElementById('testLabel'),
-      detailChannel: document.getElementById('detailChannel'),
       measurementSummary: document.getElementById('measurementSummary'),
       serviceUuid: document.getElementById('serviceUuid'),
       characteristicUuid: document.getElementById('characteristicUuid'),
@@ -992,26 +975,25 @@
           }
 
           const frame = receiveBuffer.slice(0, DATA_FRAME_LENGTH);
+          receiveBuffer = receiveBuffer.slice(DATA_FRAME_LENGTH);
+
           let checksum = 0;
-          for (let index = 1; index <= 15; index += 1) {
+          for (let index = 1; index <= 14; index += 1) {
             checksum = (checksum + frame[index]) & 0xFF;
           }
 
-          const channel = frame[3];
-          if (checksum !== frame[16] || channel >= CHANNELS.length) {
+          if (checksum !== frame[15]) {
             errorFrames += 1;
-            receiveBuffer = receiveBuffer.slice(1);
             updateCounters();
             continue;
           }
 
-          receiveBuffer = receiveBuffer.slice(DATA_FRAME_LENGTH);
           const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
           const point = view.getUint16(1, true);
-          const current = view.getInt32(4, true);
-          const ibase = view.getInt32(8, true);
-          const ipulse = view.getInt32(12, true);
-          acceptDataPoint(point, channel, current, ibase, ipulse);
+          const current = view.getInt32(3, true);
+          const ibase = view.getInt32(7, true);
+          const ipulse = view.getInt32(11, true);
+          acceptDataPoint(point, current, ibase, ipulse);
           continue;
         }
 
@@ -1051,29 +1033,17 @@
       }
     }
 
-    function detailSamples() {
-      const channel = Number(elements.detailChannel.value);
-      return plotData.filter(sample => sample.channel === channel);
-    }
-
-    function updateDetailValues() {
-      const samples = detailSamples();
-      const latest = samples[samples.length - 1];
-      elements.pointValue.textContent = latest ? String(latest.point) : '—';
-      elements.currentValue.textContent = latest ? latest.current + ' nA' : '—';
-      elements.baseValue.textContent = latest ? latest.ibase + ' nA' : '—';
-      elements.pulseValue.textContent = latest ? latest.ipulse + ' nA' : '—';
-      elements.rawPointCount.textContent = samples.length + ' 对采样';
-    }
-
-    function acceptDataPoint(point, channel, current, ibase, ipulse) {
+    function acceptDataPoint(point, current, ibase, ipulse) {
       validFrames += 1;
-      plotData.push({ point, channel, current, ibase, ipulse });
+      plotData.push({ point, current, ibase, ipulse });
       if (plotData.length > MAX_PLOT_POINTS) {
         plotData.splice(0, plotData.length - MAX_PLOT_POINTS);
       }
 
-      updateDetailValues();
+      elements.pointValue.textContent = String(point);
+      elements.currentValue.textContent = `${current} nA`;
+      elements.baseValue.textContent = `${ibase} nA`;
+      elements.pulseValue.textContent = `${ipulse} nA`;
       updateCounters();
       drawChart();
       drawRawChart();
@@ -1082,17 +1052,12 @@
     function updateCounters() {
       elements.validValue.textContent = String(validFrames);
       elements.errorValue.textContent = String(errorFrames);
-      const counts = CHANNELS.map(({ id }) => plotData.filter(sample => sample.channel === id));
-      elements.pointCount.textContent = 'WE1 ' + counts[0].length + ' 点 · WE2 ' + counts[1].length + ' 点';
-      const summary = counts.map((samples, i) => {
-        const stats = summarizeTimingSamples(samples);
-        const label = 'WE' + (i + 1) + ' ';
-        return stats
-          ? label + stats.count + '/23 点，dI 均值 ' + stats.mean.toFixed(1)
-            + ' nA，峰峰值 ' + stats.peakToPeak + ' nA'
-          : label + '等待数据';
-      });
-      elements.measurementSummary.textContent = 'point 5–27 · ' + summary.join('　|　');
+      elements.pointCount.textContent = `${plotData.length} 个绘图点`;
+      elements.rawPointCount.textContent = `${plotData.length} 对采样`;
+      const summary = summarizeTimingSamples(plotData);
+      elements.measurementSummary.textContent = summary
+        ? `point 5–27：${summary.count}/23点；dI均值 ${summary.mean.toFixed(1)} nA；峰峰值 ${summary.peakToPeak} nA（${summary.min}～${summary.max}）`
+        : '固定统计区间：point 5–27，等待数据。';
     }
 
     function summarizeTimingSamples(samples) {
@@ -1111,10 +1076,9 @@
 
     function buildTimingCsv(samples, label) {
       const safeLabel = timingCsvLabel(label);
-      const rows = ['run_label,point,channel,dI_nA,Ibase_nA,Ipulse_nA'];
+      const rows = ['run_label,point,dI_nA,Ibase_nA,Ipulse_nA'];
       for (const sample of samples) {
-        rows.push([safeLabel, sample.point, CHANNELS[sample.channel].name,
-          sample.current, sample.ibase, sample.ipulse].join(','));
+        rows.push([safeLabel, sample.point, sample.current, sample.ibase, sample.ipulse].join(','));
       }
       return rows.join('\r\n') + '\r\n';
     }
@@ -1142,7 +1106,10 @@
       plotData = [];
       validFrames = 0;
       errorFrames = 0;
-      updateDetailValues();
+      elements.pointValue.textContent = '—';
+      elements.currentValue.textContent = '—';
+      elements.baseValue.textContent = '—';
+      elements.pulseValue.textContent = '—';
       updateCounters();
       drawChart();
       drawRawChart();
@@ -1193,7 +1160,8 @@
         text: themeColor('--text'),
         muted: themeColor('--muted'),
         line: themeColor('--line'),
-        surface: themeColor('--surface')
+        surface: themeColor('--surface'),
+        primary: themeColor('--primary')
       };
       const margin = { left: width < 430 ? 58 : 70, right: 14, top: 16, bottom: 48 };
       const plotWidth = Math.max(1, width - margin.left - margin.right);
@@ -1266,36 +1234,36 @@
       context.beginPath();
       context.rect(margin.left, margin.top, plotWidth, plotHeight);
       context.clip();
-      for (const channel of CHANNELS) {
-        const samples = plotData.filter(sample => sample.channel === channel.id);
-        let previous = null;
-        let latestVisible = null;
-        context.beginPath();
-        for (const sample of samples) {
-          if (sample.point < domain.xMin || sample.point > domain.xMax
-            || sample.current < domain.yMin || sample.current > domain.yMax) {
-            previous = null;
-            continue;
-          }
-          const x = xToPixel(sample.point);
-          const y = yToPixel(sample.current);
-          if (previous && sample.point === previous.point + 1) context.lineTo(x, y);
-          else context.moveTo(x, y);
-          previous = sample;
-          latestVisible = sample;
+      context.beginPath();
+      let drawing = false;
+      for (const sample of plotData) {
+        if (sample.point < domain.xMin || sample.point > domain.xMax
+          || sample.current < domain.yMin || sample.current > domain.yMax) {
+          drawing = false;
+          continue;
         }
-        context.strokeStyle = channel.color;
-        context.lineWidth = 2;
-        context.lineJoin = 'round';
-        context.lineCap = 'round';
-        context.stroke();
+        const x = xToPixel(sample.point);
+        const y = yToPixel(sample.current);
+        if (!drawing) {
+          context.moveTo(x, y);
+          drawing = true;
+        } else {
+          context.lineTo(x, y);
+        }
+      }
+      context.strokeStyle = colors.primary;
+      context.lineWidth = 2;
+      context.lineJoin = 'round';
+      context.lineCap = 'round';
+      context.stroke();
 
-        if (latestVisible) {
-          context.beginPath();
-          context.arc(xToPixel(latestVisible.point), yToPixel(latestVisible.current), 3.5, 0, Math.PI * 2);
-          context.fillStyle = channel.color;
-          context.fill();
-        }
+      const latest = plotData[plotData.length - 1];
+      if (latest.point >= domain.xMin && latest.point <= domain.xMax
+        && latest.current >= domain.yMin && latest.current <= domain.yMax) {
+        context.beginPath();
+        context.arc(xToPixel(latest.point), yToPixel(latest.current), 3.5, 0, Math.PI * 2);
+        context.fillStyle = colors.primary;
+        context.fill();
       }
       context.restore();
     }
@@ -1344,7 +1312,7 @@
         return;
       }
 
-      const visible = detailSamples().filter(sample => sample.point >= xMin
+      const visible = plotData.filter(sample => sample.point >= xMin
         && sample.point <= xMax
         && Number.isFinite(sample.ibase)
         && Number.isFinite(sample.ipulse));
@@ -1425,7 +1393,7 @@
         visible.forEach((sample, index) => {
           const x = xToPixel(sample.point);
           const y = yToPixel(sample[key]);
-          if (index === 0 || sample.point !== visible[index - 1].point + 1) rawContext.moveTo(x, y);
+          if (index === 0) rawContext.moveTo(x, y);
           else rawContext.lineTo(x, y);
         });
         rawContext.strokeStyle = color;
@@ -1474,10 +1442,6 @@
     });
     elements.clearButton.addEventListener('click', clearChart);
     elements.exportButton.addEventListener('click', exportTimingCsv);
-    elements.detailChannel.addEventListener('change', () => {
-      updateDetailValues();
-      drawRawChart();
-    });
     [elements.xMin, elements.xMax, elements.yMin, elements.yMax]
       .forEach(input => input.addEventListener('input', () => {
         drawChart();
